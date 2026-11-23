@@ -1,0 +1,177 @@
+name: Dirronlive build (zip)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  # Анализ кода и все тесты программы. Ошибки видны прямо в сводке запуска.
+  tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dirronlive
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack project archive
+        working-directory: .
+        run: |
+          for z in *.zip; do
+            if unzip -l "$z" | grep -q "dirronlive/dirronlive_bridge/build.gradle"; then
+              unzip -q -o "$z"
+              echo "::notice title=archive::Распакован $z"
+              exit 0
+            fi
+          done
+          echo "::error title=archive::В репозитории нет архива dirronlive-v0.4.0.zip — загрузите его через Add file → Upload files"
+          exit 1
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: |
+          set +e
+          flutter analyze --no-fatal-infos > analyze.txt 2>&1
+          status=$?
+          cat analyze.txt
+          python3 - <<'PY'
+          import re
+          for line in open('analyze.txt', encoding='utf-8', errors='replace'):
+              m = re.match(r'\s*(error|warning|info)\s+•\s+(.*?)\s+•\s+(\S+?):(\d+):(\d+)\s+•\s+(\S+)', line)
+              if m:
+                  level = {'error': 'error', 'warning': 'warning'}.get(m[1], 'notice')
+                  print(f"::{level} file={m[3]},line={m[4]},col={m[5]},title=analyze {m[6]}::{m[2]}")
+          PY
+          exit $status
+
+      - name: Tests
+        if: always()
+        run: |
+          set +e
+          flutter test --machine > test-results.jsonl
+          status=$?
+          python3 - <<'PY'
+          import json
+          names, passed, failed = {}, 0, []
+          for raw in open('test-results.jsonl', encoding='utf-8', errors='replace'):
+              raw = raw.strip()
+              if not raw.startswith('{'):
+                  continue
+              try:
+                  e = json.loads(raw)
+              except ValueError:
+                  continue
+              kind = e.get('type')
+              if kind == 'testStart':
+                  names[e['test']['id']] = e['test']['name']
+              elif kind == 'error':
+                  name = names.get(e.get('testID'), 'loading')
+                  msg = (e.get('error', '') + '\n' + e.get('stackTrace', ''))[:1500]
+                  msg = msg.replace('%', '%25').replace('\r', '').replace('\n', '%0A')
+                  print(f"::error title=FAILED {name[:120]}::{msg}")
+                  failed.append(name)
+              elif kind == 'testDone' and not e.get('hidden') and e.get('result') == 'success':
+                  passed += 1
+          print(f"::notice title=Flutter tests::{passed} passed, {len(set(failed))} failed")
+          PY
+          exit $status
+
+  # Установщик Windows и портативная версия.
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: dirronlive
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack project archive
+        working-directory: .
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = Get-ChildItem -Filter *.zip | Where-Object {
+            $a = [IO.Compression.ZipFile]::OpenRead($_.FullName)
+            $ok = $a.Entries.FullName -contains 'dirronlive/dirronlive_bridge/build.gradle'
+            $a.Dispose(); $ok
+          } | Select-Object -First 1
+          if (-not $zip) { Write-Host "::error title=archive::В репозитории нет архива dirronlive-v0.4.0.zip"; exit 1 }
+          Expand-Archive -Path $zip.FullName -DestinationPath . -Force
+          Write-Host "::notice title=archive::Распакован $($zip.Name)"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Prepare Windows project
+        shell: pwsh
+        run: ./tools/setup_windows.ps1
+
+      - name: Build release
+        run: flutter build windows --release
+
+      - name: Bundle Visual C++ runtime
+        shell: pwsh
+        run: ./tools/bundle_vcruntime.ps1
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc installer\dirronlive.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Compress-Archive -Path build\windows\x64\runner\Release\* -DestinationPath build\installer\Dirronlive-0.4.0-portable.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Dirronlive-Windows
+          path: dirronlive/build/installer/*
+
+  # Мод Dirronlive Bridge для Minecraft 1.21.1 Fabric.
+  mod:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dirronlive/dirronlive_bridge
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack project archive
+        working-directory: .
+        run: |
+          for z in *.zip; do
+            if unzip -l "$z" | grep -q "dirronlive/dirronlive_bridge/build.gradle"; then
+              unzip -q -o "$z"
+              echo "::notice title=archive::Распакован $z"
+              exit 0
+            fi
+          done
+          echo "::error title=archive::В репозитории нет архива dirronlive-v0.4.0.zip — загрузите его через Add file → Upload files"
+          exit 1
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+          cache-dependency-path: |
+            **/*.gradle*
+            **/gradle-wrapper.properties
+
+      - name: Build mod, check the map in Minecraft, build the world
+        run: bash ../tools/ci_mod.sh
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: DirronParkour-mod-and-world
+          path: |
+            dirronlive/dirronlive_bridge/build/installer/*
+            dirronlive/dirronlive_bridge/gametest.log
+          if-no-files-found: warn
